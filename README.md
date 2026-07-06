@@ -8,11 +8,16 @@ watched market's odds move past a threshold.
 
 | Tool | What it does |
 |---|---|
-| `search_markets(query)` | Search open Polymarket markets by keyword. Returns `question`, `slug`, `yes_token_id`, `yes_price` (0–1). |
-| `watch_market(yes_token_id, label, threshold_points=5)` | Watch a market; baseline is the current YES price; threshold is in percentage points. |
+| `search_markets(query)` | Search open Polymarket events by keyword. Returns up to 8 events, each with `title`, `url` (the live polymarket.com page, taken from the API), and `outcomes` — **every** selectable outcome as `{outcome, token_id, price}` (price 0–1). A yes/no market is two outcomes; a sports matchup is three (e.g. USA / Draw / Belgium); an election board is one per candidate (capped at the top 12 by price, with a note). Settled markets are excluded. |
+| `watch_market(token_id, label, threshold_points=5)` | Watch **one specific outcome** (its `token_id` from `search_markets`); baseline is that outcome's current price; threshold is in percentage points. Watching a settled or unknown token returns a clear message instead of a bad watch. |
 | `list_watches()` | Your watches with baseline and threshold. |
 | `unwatch(label)` | Remove a watch by label. |
 | `check_moves()` | Watches that crossed their threshold since the last check (`label`, `old_pct`, `new_pct`, `delta_pts`); resets their baselines. |
+
+The binary yes/no case is just the two-outcome special case of the same
+mechanism — watching a yes/no market means watching its "Yes" outcome's
+token. Poke is instructed (via the tool docstrings) to present the outcomes
+and ask which one to track before calling `watch_market`.
 
 All state is scoped per user via the `X-Poke-User-Id` header Poke sends on
 every request (falls back to `"owner"` for local testing), persisted to a JSON
@@ -44,9 +49,11 @@ With the server running:
 ```
 
 This completes an MCP initialize handshake over streamable HTTP, checks all
-five tools are listed, and calls `search_markets("fed")`, asserting a
-non-empty, well-formed result. To test an auth-enabled server (including the
-deployed one), pass the token and URL:
+five tools are listed, then exercises both market shapes against live data:
+a binary yes/no market (search → two outcomes → watch → list → unwatch) and
+a multi-outcome board (3+ labelled outcomes with distinct token ids), plus
+the failure modes (bogus token, nonsense query). To test an auth-enabled
+server (including the deployed one), pass the token and URL:
 
 ```bash
 MCP_URL=https://<your-app>.up.railway.app/mcp MCP_AUTH_TOKEN=<token> \
@@ -59,21 +66,40 @@ Field names were confirmed with real requests during development; a wrong
 field name here fails silently (no alerts ever fire), so re-verify these if
 Polymarket changes its APIs.
 
-**Search — `GET https://gamma-api.polymarket.com/public-search?q=<query>`**
+**Search — `GET https://gamma-api.polymarket.com/public-search?q=<query>&events_status=active`**
 
-Returns `{"events": [...], "pagination": {...}}`; each event has a `markets`
-list. Per market:
+Returns `{"events": [...], "pagination": {...}}`. **The unit of search is the
+event, which groups one or more markets** — this grouping is the whole story
+for multi-outcome correctness:
 
-- `question` (str), `slug` (str)
-- `active` / `closed` / `archived` (bools — we keep only
-  `active && !closed && !archived`)
+- A multi-outcome board (sports matchup, election, "Fed decision in July?")
+  is **one event holding one binary Yes/No market per outcome**. The World
+  Cup match event "United States vs. Belgium" (slug
+  `fifwc-usa-bel-2026-07-06`) holds three markets: "Will United States
+  win…", "…end in a draw?", "Will Belgium win…". Each market's
+  `groupItemTitle` is the outcome label shown on the board ("United States",
+  "Draw (United States vs. Belgium)", "Belgium"), and the outcome's price is
+  that market's YES price. The three YES prices sum to ~1 across the board.
+- A plain "will X happen" question is an event with a single binary market;
+  its two outcomes are the market's own legs.
+- `events_status=active` filters settled events server-side; markets also
+  settle **individually** inside a live event, so we additionally keep only
+  `active && !closed && !archived` at both levels.
+
+Per event: `title`, `slug`, `active`/`closed`/`archived`, `markets`. Per
+market:
+
+- `question` (str), `slug` (str), `groupItemTitle` (str — outcome label)
+- `active` / `closed` / `archived` (bools)
 - `clobTokenIds` — **JSON-encoded string**, e.g. `'["2718…", "4095…"]'`
 - `outcomes` — **JSON-encoded string**, e.g. `'["Yes", "No"]'`
-- `outcomePrices` — **JSON-encoded string**, e.g. `'["0.07", "0.93"]'`
+- `outcomePrices` — **JSON-encoded string**, e.g. `'["0.365", "0.635"]'`
 
 The three quoted fields need a second `json.loads` and are index-aligned:
-the YES token id and price sit at `outcomes.index("Yes")` (index 0 in
-practice, but we look it up).
+leg *i* of a market is `(outcomes[i], clobTokenIds[i], outcomePrices[i])`.
+
+`q` matches **title text only** — "usa" does *not* match "United States vs.
+Belgium". See the teams lookup below for how we bridge that.
 
 Note: the plain `GET /markets?order=volume` sort used by an earlier draft is
 **not** a real sort field on the live API (it returns near-zero-volume
@@ -81,11 +107,34 @@ markets); `public-search` handles relevance ranking server-side, so we use it
 instead. `volumeNum` / `volume24hr` are the working sort fields if you ever
 need `/markets` ordering.
 
+**Links — `https://polymarket.com/event/<event.slug>`**
+
+Always resolves: plain events serve directly (200), sports events
+307-redirect to their canonical page (e.g.
+`/sports/world-cup/fifwc-usa-bel-2026-07-06`). The slug must come from the
+API — a hand-built `/event/usa-vs-belgium` 404s, which was the original
+link bug.
+
+**Team abbreviations — `GET https://gamma-api.polymarket.com/teams?abbreviation=<abbr>&limit=50`**
+
+Maps abbreviations to canonical team/country names across leagues (`usa` →
+"United States" ×13, `bel` → "Belgium" ×13). **The abbreviation must be
+lowercase** (`USA` returns `[]`). `search_markets` expands short query
+tokens through this endpoint and searches both phrasings, so "usa belgium"
+finds "United States vs. Belgium". A token is only expanded when ≥ 4 teams
+share the top name, which filters flukes like "fed" or "will".
+
+**Watch validation — `GET https://gamma-api.polymarket.com/markets?clob_token_ids=<token_id>`**
+
+Returns `[<market>]` for an open market and `[]` for unknown **or settled**
+tokens (closed markets are omitted from this query), so it doubles as the
+watchability check in `watch_market`.
+
 **Price — `GET https://clob.polymarket.com/midpoint?token_id=<id>`**
 
-Returns `{"mid": "0.07"}` — field name `mid`, value a **string** between 0
-and 1 (parse with `float`). The YES-token midpoint stands in for implied
-probability. Unknown token ids return HTTP 404.
+Returns `{"mid": "0.365"}` — field name `mid`, value a **string** between 0
+and 1 (parse with `float`). The outcome-token midpoint stands in for implied
+probability. Unknown or settled token ids return HTTP 404.
 
 **Push — `POST https://poke.com/api/v1/inbound/api-message`**
 
@@ -174,6 +223,7 @@ list about every 5 minutes.
 
 The published, multi-user version drops the poller (`PUSH_MODE=0`) and leans
 on `check_moves` + per-user Poke automations; no code changes needed. Tool
-interfaces are deliberately source-agnostic (`yes_token_id` is just an opaque
-id to callers), so a second provider (e.g. Kalshi) can slot in behind the
-same tool names later.
+interfaces are deliberately source-agnostic (`token_id` is just an opaque
+outcome id to callers, and search results are `{title, url, outcomes}` with
+nothing Polymarket-specific in the shape), so a second provider (e.g. Kalshi)
+can slot in behind the same tool names later.

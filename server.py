@@ -31,6 +31,7 @@ import os
 import sys
 import threading
 import time
+from collections import Counter
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -96,7 +97,15 @@ _lock = threading.Lock()
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            state = json.loads(STATE_FILE.read_text())
+            # Watches written before outcome-aware tracking stored the token
+            # under "yes_token_id"; normalize so the rest of the code only
+            # ever sees "token_id".
+            for watches in state.values():
+                for w in watches.values():
+                    if "token_id" not in w and "yes_token_id" in w:
+                        w["token_id"] = w.pop("yes_token_id")
+            return state
         except (json.JSONDecodeError, OSError) as e:
             print(f"[state] could not read {STATE_FILE}: {e}; starting empty")
     return {}
@@ -115,65 +124,201 @@ STATE = load_state()
 # --- Polymarket helpers ------------------------------------------------------
 #
 # Verified live 2026-07-06:
-#   GET {GAMMA}/public-search?q=<query>
-#     -> {"events": [{..., "markets": [<market>, ...]}], "pagination": {...}}
+#   GET {GAMMA}/public-search?q=<query>&events_status=active
+#     -> {"events": [<event>, ...], "pagination": {...}}
+#   The unit of search is the EVENT, which groups one or more markets. A
+#   multi-outcome board (sports matchup, election, "Fed decision") is one
+#   event holding one binary Yes/No market PER OUTCOME; e.g. the World Cup
+#   match event "United States vs. Belgium" (slug fifwc-usa-bel-2026-07-06)
+#   holds three markets: "Will United States win...", "...end in a draw?",
+#   "Will Belgium win...". A plain "will X happen" question is an event with
+#   a single binary market. Matching on q is against title text — "usa" does
+#   NOT match "United States" (see _expand_team_abbreviations below).
+#
+#   Each <event> carries:
+#     "title"   str          "slug"     str (the canonical URL slug, see below)
+#     "active"/"closed"/"archived"  bools
+#     "markets" [<market>, ...]
 #   Each <market> carries:
-#     "question"      str
-#     "slug"          str
-#     "active"        bool, "closed" bool, "archived" bool
-#     "clobTokenIds"  JSON-encoded string: '["<yes_id>", "<no_id>"]'
-#     "outcomes"      JSON-encoded string: '["Yes", "No"]'
-#     "outcomePrices" JSON-encoded string: '["0.07", "0.93"]'
-#   clobTokenIds/outcomes/outcomePrices need a second json.loads and are
-#   index-aligned, so the YES token/price sit at outcomes.index("Yes").
+#     "question"       str
+#     "groupItemTitle" str — the outcome label on a grouped event's board,
+#                      e.g. "United States", "Draw (United States vs. Belgium)"
+#     "active" / "closed" / "archived"  bools (markets settle individually)
+#     "clobTokenIds"   JSON-encoded string: '["<token>", "<token>"]'
+#     "outcomes"       JSON-encoded string: '["Yes", "No"]'
+#     "outcomePrices"  JSON-encoded string: '["0.365", "0.635"]'
+#   The three quoted fields need a second json.loads and are index-aligned:
+#   leg i of the market is (outcomes[i], clobTokenIds[i], outcomePrices[i]).
+#
+#   https://polymarket.com/event/<event.slug> always resolves: plain events
+#   serve directly, sports events 307-redirect to their canonical page
+#   (e.g. /sports/world-cup/fifwc-usa-bel-2026-07-06). Never hand-build a
+#   slug from the title — that was the bug this layer replaces.
+#
+#   GET {GAMMA}/teams?abbreviation=<abbr>&limit=50   (abbr must be lowercase)
+#     -> [{"name": "United States", "league": "rl", ...}, ...]
+#   Maps team/country abbreviations to canonical names across leagues.
+#
+#   GET {GAMMA}/markets?clob_token_ids=<token_id>
+#     -> [<market>] for an open market, [] for unknown OR settled tokens
+#     (closed markets are not returned), so it validates watchability.
 #
 #   GET {CLOB}/midpoint?token_id=<id>
-#     -> {"mid": "0.07"}   (string, 0..1)
+#     -> {"mid": "0.365"}  (string, 0..1); 404 for unknown/settled tokens.
+
+MAX_EVENTS = 8      # search results returned
+MAX_OUTCOMES = 12   # outcomes listed per event (big boards hold 100+ markets)
 
 
-def _parse_market(m: dict) -> dict | None:
-    """Pull question/slug/yes token/yes price out of a raw Gamma market dict.
-    Returns None for markets that are closed or missing orderbook data."""
-    if not m.get("active") or m.get("closed") or m.get("archived"):
+def _is_open(obj: dict) -> bool:
+    """True for an event or market that is live and watchable."""
+    return bool(obj.get("active")) and not obj.get("closed") and not obj.get("archived")
+
+
+def _market_legs(m: dict) -> list[dict]:
+    """All tradable legs of one market: [{outcome, token_id, price}, ...].
+    Raises ValueError on a shape we don't understand."""
+    token_ids = json.loads(m.get("clobTokenIds") or "[]")
+    outcomes = json.loads(m.get("outcomes") or "[]")
+    prices = json.loads(m.get("outcomePrices") or "[]")
+    if not token_ids or not isinstance(token_ids, list):
+        raise ValueError("no clobTokenIds")
+    return [
+        {
+            "outcome": str(outcomes[i]) if i < len(outcomes) else f"Outcome {i + 1}",
+            "token_id": token_ids[i],
+            "price": float(prices[i]) if i < len(prices) else None,
+        }
+        for i in range(len(token_ids))
+    ]
+
+
+def _event_to_result(ev: dict) -> dict | None:
+    """Turn a raw Gamma event into a source-agnostic search result:
+    {title, url, outcomes: [{outcome, token_id, price}, ...]}.
+    Returns None for settled events; skips malformed markets with a log line.
+
+    A single-market event exposes that market's own legs (the binary Yes/No
+    case, or an old-style market carrying 3+ outcomes in one array). A
+    multi-market event exposes one outcome per open market — its YES leg,
+    labelled by groupItemTitle — which is exactly the Polymarket board."""
+    if not _is_open(ev):
         return None
-    try:
-        token_ids = json.loads(m.get("clobTokenIds") or "[]")
-        outcomes = json.loads(m.get("outcomes") or "[]")
-        prices = json.loads(m.get("outcomePrices") or "[]")
-    except json.JSONDecodeError:
+    open_markets = [m for m in ev.get("markets") or [] if _is_open(m)]
+    outcomes: list[dict] = []
+    for m in open_markets:
+        try:
+            legs = _market_legs(m)
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            print(f"[search] skipping malformed market {m.get('slug')!r}: {e}")
+            continue
+        if len(open_markets) == 1:
+            outcomes = legs
+        else:
+            yes = next(
+                (l for l in legs if l["outcome"].lower() == "yes"), legs[0]
+            )
+            outcomes.append(
+                {
+                    "outcome": m.get("groupItemTitle") or m.get("question"),
+                    "token_id": yes["token_id"],
+                    "price": yes["price"],
+                }
+            )
+    if not outcomes or not ev.get("slug"):
         return None
-    if not token_ids:
-        return None
-    yes_idx = next(
-        (i for i, o in enumerate(outcomes) if str(o).lower() == "yes"), 0
-    )
-    if yes_idx >= len(token_ids):
-        return None
-    return {
-        "question": m.get("question"),
-        "slug": m.get("slug"),
-        "yes_token_id": token_ids[yes_idx],
-        "yes_price": float(prices[yes_idx]) if yes_idx < len(prices) else None,
+    result = {
+        "title": ev.get("title"),
+        # Slug straight from the API; /event/<slug> always resolves (sports
+        # events redirect to their canonical /sports/... page).
+        "url": f"https://polymarket.com/event/{ev['slug']}",
+        "outcomes": outcomes,
     }
+    if len(outcomes) > MAX_OUTCOMES:
+        outcomes.sort(key=lambda o: o["price"] if o["price"] is not None else -1, reverse=True)
+        result["outcomes"] = outcomes[:MAX_OUTCOMES]
+        result["note"] = (
+            f"Showing top {MAX_OUTCOMES} of {len(outcomes)} outcomes by price."
+        )
+    return result
 
 
-async def search_polymarket(query: str, limit: int = 8) -> list[dict]:
+async def _search_events(client: httpx.AsyncClient, query: str) -> list[dict]:
+    r = await client.get(
+        f"{GAMMA}/public-search",
+        params={"q": query, "events_status": "active"},
+    )
+    r.raise_for_status()
+    return r.json().get("events") or []
+
+
+async def _expand_team_abbreviations(
+    client: httpx.AsyncClient, query: str
+) -> str | None:
+    """public-search matches title text, and sports event titles use full
+    team names ("United States vs. Belgium"), so a query like "usa belgium"
+    misses them. For each short alpha token, ask /teams whether it is a known
+    team abbreviation; if one canonical name clearly dominates (>= 4 teams
+    across leagues share it — filters flukes like "will" or "fed"), swap it
+    in. Returns the expanded query, or None if nothing was expanded."""
+    words = query.split()
+    expanded: list[str] = []
+    changed = False
+    for w in words:
+        name = None
+        if 2 <= len(w) <= 4 and w.isalpha():
+            try:
+                r = await client.get(
+                    f"{GAMMA}/teams",
+                    params={"abbreviation": w.lower(), "limit": 50},
+                )
+                r.raise_for_status()
+                counts = Counter(t["name"] for t in r.json() if t.get("name"))
+                top = counts.most_common(1)
+                if top and top[0][1] >= 4 and top[0][0].lower() != w.lower():
+                    name = top[0][0]
+            except (httpx.HTTPError, ValueError) as e:
+                print(f"[search] team lookup for {w!r} failed: {e}")
+        expanded.append(name or w)
+        changed = changed or name is not None
+    return " ".join(expanded) if changed else None
+
+
+async def search_polymarket(query: str, limit: int = MAX_EVENTS) -> list[dict]:
+    """Search open events for a query, interleaving results for the raw query
+    with results for the team-abbreviation-expanded variant (when one exists),
+    deduplicated by event slug."""
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(f"{GAMMA}/public-search", params={"q": query})
-        r.raise_for_status()
-        events = r.json().get("events") or []
+        raw = await _search_events(client, query)
+        variant = await _expand_team_abbreviations(client, query)
+        alt = await _search_events(client, variant) if variant else []
     out: list[dict] = []
     seen: set[str] = set()
-    for ev in events:
-        for m in ev.get("markets") or []:
-            parsed = _parse_market(m)
-            if parsed is None or parsed["yes_token_id"] in seen:
+    # Interleave so the best hit of either phrasing lands near the top.
+    for i in range(max(len(raw), len(alt))):
+        for ev in (raw[i : i + 1] + alt[i : i + 1]):
+            slug = ev.get("slug")
+            if not slug or slug in seen:
                 continue
-            seen.add(parsed["yes_token_id"])
-            out.append(parsed)
-            if len(out) >= limit:
-                return out
+            seen.add(slug)
+            parsed = _event_to_result(ev)
+            if parsed is not None:
+                out.append(parsed)
+                if len(out) >= limit:
+                    return out
     return out
+
+
+async def lookup_market_by_token(token_id: str) -> dict | None:
+    """The Gamma market carrying this CLOB token, or None for tokens that are
+    unknown or already settled (Gamma omits closed markets from this query)."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            f"{GAMMA}/markets", params={"clob_token_ids": token_id}
+        )
+        r.raise_for_status()
+        markets = r.json()
+    return markets[0] if markets else None
 
 
 def _parse_mid(payload: dict) -> float | None:
@@ -182,7 +327,7 @@ def _parse_mid(payload: dict) -> float | None:
 
 
 async def fetch_price(token_id: str) -> float | None:
-    """Async YES-token midpoint (0..1), used by tool handlers."""
+    """Async outcome-token midpoint (0..1), used by tool handlers."""
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(f"{CLOB}/midpoint", params={"token_id": token_id})
         r.raise_for_status()
@@ -259,33 +404,66 @@ mcp = FastMCP("Prediction Market Pulse", stateless_http=True)
 
 
 @mcp.tool()
-async def search_markets(query: str) -> list[dict]:
+async def search_markets(query: str) -> list[dict] | str:
     """Search open Polymarket prediction markets by keyword (e.g. "fed",
-    "election"). Returns up to 8 markets, each with: question (the market
-    title), slug, yes_token_id (pass this to watch_market), and yes_price
-    (current YES probability, 0 to 1)."""
-    return await search_polymarket(query)
+    "election", "usa belgium"). Returns up to 8 events, each with: title,
+    url (the live polymarket.com page), and outcomes — every selectable
+    outcome as {outcome, token_id, price} where price is the current implied
+    probability (0 to 1). A yes/no market has two outcomes; a sports matchup
+    or election board has one per candidate (e.g. USA / Draw / Belgium).
+    Before calling watch_market, show the user the outcomes and confirm WHICH
+    one to track, then pass that outcome's token_id. Settled markets are
+    excluded. Returns a plain message when nothing matches."""
+    results = await search_polymarket(query)
+    if not results:
+        return (
+            f"No open markets found for '{query}'. Try different or more "
+            "specific keywords, or full team/country names (e.g. 'united "
+            "states' rather than 'usa')."
+        )
+    return results
 
 
 @mcp.tool()
 async def watch_market(
-    yes_token_id: str, label: str, threshold_points: float = 5.0
+    token_id: str, label: str, threshold_points: float = 5.0
 ) -> str:
-    """Start watching a Polymarket market for odds moves. Records the current
-    YES probability as the baseline; the market counts as "moved" once the
-    probability shifts by at least threshold_points percentage points from
-    that baseline. Get yes_token_id from search_markets. Pick a short,
-    human-readable label -- it is how the watch is referenced later."""
+    """Start watching one outcome of a Polymarket market for odds moves.
+    token_id must be the token_id of the specific outcome to track, taken
+    from search_markets (for a yes/no market that is usually the "Yes"
+    outcome; for a matchup pick the side, e.g. USA-to-win's token). Records
+    the current probability as the baseline; the watch counts as "moved" once
+    it shifts by at least threshold_points percentage points. Pick a label
+    that names BOTH the outcome and the market unambiguously, e.g. "USA to
+    win (USA vs Belgium)" — it is how the watch is referenced later."""
+    market = None
     try:
-        price = await fetch_price(yes_token_id)
+        market = await lookup_market_by_token(token_id)
+    except (httpx.HTTPError, ValueError) as e:
+        # Validation is best-effort; the midpoint fetch below still gates.
+        print(f"[watch] token lookup failed for {token_id}: {e}")
+    else:
+        if market is None:
+            return (
+                f"Token {token_id} is not an open market — it may have "
+                "settled or the id may be wrong. Search again and pick an "
+                "outcome from the current results."
+            )
+        if not _is_open(market):
+            return (
+                f"That market ('{market.get('question')}') has settled and "
+                "can no longer be watched."
+            )
+    try:
+        price = await fetch_price(token_id)
     except httpx.HTTPError as e:
-        return f"Could not reach Polymarket for token {yes_token_id}: {e}"
+        return f"Could not reach Polymarket for token {token_id}: {e}"
     if price is None:
-        return f"Could not read a price for token {yes_token_id}."
+        return f"Could not read a price for token {token_id}."
     uid = current_user()
     with _lock:
         STATE.setdefault(uid, {})[label] = {
-            "yes_token_id": yes_token_id,
+            "token_id": token_id,
             "threshold": float(threshold_points),
             "last_price": price,
         }
@@ -298,13 +476,13 @@ async def watch_market(
 
 @mcp.tool()
 def list_watches() -> list[dict]:
-    """List the markets currently being watched for this user. Each entry has
-    label, yes_price (the baseline YES probability, 0 to 1), and threshold
-    (alert trigger, in percentage points)."""
+    """List the outcomes currently being watched for this user. Each entry
+    has label, price (the baseline probability of the watched outcome, 0 to
+    1), and threshold (alert trigger, in percentage points)."""
     uid = current_user()
     with _lock:
         return [
-            {"label": k, "yes_price": v["last_price"], "threshold": v["threshold"]}
+            {"label": k, "price": v["last_price"], "threshold": v["threshold"]}
             for k, v in STATE.get(uid, {}).items()
         ]
 
@@ -335,7 +513,7 @@ async def check_moves() -> list[dict]:
         for label, w in watches.items():
             try:
                 r = await client.get(
-                    f"{CLOB}/midpoint", params={"token_id": w["yes_token_id"]}
+                    f"{CLOB}/midpoint", params={"token_id": w["token_id"]}
                 )
                 r.raise_for_status()
                 mid = _parse_mid(r.json())
@@ -359,7 +537,7 @@ def poller() -> None:
                     prices: dict[str, float] = {}
                     for label, w in watches.items():
                         try:
-                            mid = fetch_price_sync(client, w["yes_token_id"])
+                            mid = fetch_price_sync(client, w["token_id"])
                             if mid is not None:
                                 prices[label] = mid
                         except (httpx.HTTPError, ValueError) as e:
