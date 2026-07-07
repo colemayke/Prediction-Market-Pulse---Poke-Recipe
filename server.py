@@ -4,9 +4,13 @@ Prediction Market Pulse - Poke MCP server plus a proactive push poller.
 Two jobs in one process:
 
   1. MCP tools (search_markets, watch_market, list_watches, unwatch,
-     check_moves) that Poke calls during conversations. Served over
-     streamable HTTP at /mcp so `npx poke tunnel http://localhost:3000/mcp`
-     can reach it.
+     check_moves) that Poke calls during conversations. Served over TWO
+     transports on the same port: streamable HTTP at /mcp (what
+     `npx poke tunnel http://localhost:3000/mcp` uses) and SSE at /sse with
+     its POST companion at /messages/ (what Poke's hosted integration
+     connects to — verified live 2026-07-06: Poke pointed at /mcp fails
+     with 421, pointed at /sse it speaks SSE, and its docs only show
+     .../sse server URLs).
 
   2. A background poller that checks watched Polymarket markets and, when a
      market moves past its threshold, texts you via the Poke API. This is the
@@ -719,11 +723,28 @@ class UserHeaderMiddleware:
             _user_id.reset(token)
 
 
+# --- app: both transports behind one middleware stack ------------------------
+#
+# streamable_http_app() serves /mcp and owns the lifespan that starts its
+# session manager; sse_app() needs no startup, so its two routes — GET /sse
+# (the event stream Poke connects to) and POST /messages/ (client->server
+# messages) — are grafted onto the same Starlette app. One app means the
+# middleware below covers every leg of both transports, including both halves
+# of an SSE session.
+#
+# Per-user scoping on SSE: tool handlers run inside the long-lived GET /sse
+# request (the POST leg only enqueues messages into it), so the contextvar
+# the tools see is the one set from the GET's X-Poke-User-Id header — which
+# Poke sends on every request, the stream GET included.
+
+TRANSPORTS = {"streamable HTTP": "/mcp", "SSE": "/sse (POST /messages/)"}
+
+_asgi = mcp.streamable_http_app()
+_asgi.router.routes.extend(mcp.sse_app().routes)
+
 # Auth wraps the user-id middleware: unauthenticated requests are rejected
 # before any state is touched; authenticated ones still get per-user scoping.
-app = BearerAuthMiddleware(
-    UserHeaderMiddleware(mcp.streamable_http_app()), MCP_AUTH_TOKEN
-)
+app = BearerAuthMiddleware(UserHeaderMiddleware(_asgi), MCP_AUTH_TOKEN)
 
 
 if __name__ == "__main__":
@@ -734,5 +755,8 @@ if __name__ == "__main__":
         print("[poller] off (PUSH_MODE=0); Poke automations should call check_moves")
     print(f"[auth] bearer {'enforced' if MCP_AUTH_TOKEN else 'DISABLED (no MCP_AUTH_TOKEN; local dev only)'}")
     print(f"[state] {STATE_FILE}")
-    print(f"MCP on http://localhost:{PORT}/mcp")
+    for name, path in TRANSPORTS.items():
+        print(f"[mcp] {name} mounted at {path}")
+    print(f"MCP on http://localhost:{PORT}/mcp (streamable HTTP) "
+          f"and http://localhost:{PORT}/sse (SSE — the URL Poke needs)")
     uvicorn.run(app, host="0.0.0.0", port=PORT)

@@ -4,7 +4,10 @@ A single-process Python service that gives [Poke](https://poke.com) tools for
 tracking Polymarket prediction markets, and proactively texts you when a
 watched market's odds move past a threshold.
 
-**Tools exposed over MCP** (streamable HTTP at `/mcp`):
+**Tools exposed over MCP**, on two transports served by the same process:
+SSE at `/sse` (**the one Poke's hosted integration connects with** — give
+Kitchen the `/sse` URL) and streamable HTTP at `/mcp` (used by the
+`npx poke tunnel` local workflow):
 
 | Tool | What it does |
 |---|---|
@@ -58,13 +61,14 @@ python3 -m venv .venv
 cp .env.example .env        # optional locally; see comments in the file
 
 .venv/bin/python server.py
-# MCP on http://localhost:3000/mcp
+# streamable HTTP on http://localhost:3000/mcp, SSE on http://localhost:3000/sse
 ```
 
 Requires Python 3.10+ (developed and pinned on 3.14, see `.python-version`).
 
-With `MCP_AUTH_TOKEN` unset the endpoint is **open** — fine on localhost,
-never in production. When it is set, every request must carry
+With `MCP_AUTH_TOKEN` unset both endpoints are **open** — fine on localhost,
+never in production. When it is set, every request on either transport
+(including the SSE stream GET and its `/messages/` POSTs) must carry
 `Authorization: Bearer <token>` or it gets a 401.
 
 ## Test
@@ -82,8 +86,11 @@ and exercises both market shapes against live data: a binary yes/no market
 (search → two outcomes → watch → list → unwatch) and a multi-outcome board
 (3+ labelled outcomes with distinct token ids), plus the failure modes
 (bogus token, nonsense query, sub-1-point threshold clamped with an
-explanation). To test an auth-enabled server (including the deployed one),
-pass the token and URL:
+explanation). It then checks the SSE transport at `/sse`: handshake and tool
+listing, per-user scoping across two SSE sessions with different
+`X-Poke-User-Id` headers, and (when auth is on) that a token-less SSE
+connection is rejected. To test an auth-enabled server (including the
+deployed one), pass the token and URL (the SSE URL is derived from it):
 
 ```bash
 MCP_URL=https://<your-app>.up.railway.app/mcp MCP_AUTH_TOKEN=<token> \
@@ -211,23 +218,28 @@ Do these in order:
      default once the volume is mounted at `/data`)
    - Do **not** set `POKE_API_KEY`; the deployed server never pushes.
 5. **Deploy**, then generate/copy the public HTTPS domain Railway assigns
-   (Settings → Networking) and append `/mcp`:
-   `https://<your-app>.up.railway.app/mcp`.
+   (Settings → Networking) and append `/sse`:
+   `https://<your-app>.up.railway.app/sse`.
 6. **In Poke Kitchen** ([poke.com/kitchen](https://poke.com/kitchen)), open the
-   integration template: Server URL = that `/mcp` URL, **Auth Type = Bearer**,
-   token = the same `MCP_AUTH_TOKEN` value. Poke will then send
-   `Authorization: Bearer <token>` on every request, which is exactly what the
-   server's auth middleware checks. Hit Test connection — it should list the
-   five tools.
+   integration template: Server URL = that **`/sse`** URL, **Auth Type =
+   Bearer**, token = the same `MCP_AUTH_TOKEN` value. Poke's integration
+   speaks the SSE transport — pointing it at `/mcp` fails with a 421
+   (verified live), while `/sse` is the endpoint it expects (Poke's docs show
+   `https://.../sse` server URLs throughout). Poke sends
+   `Authorization: Bearer <token>` on every request, which is exactly what
+   the server's auth middleware checks. Hit Test connection — it should list
+   the five tools. (`/mcp` stays mounted for the local tunnel workflow; both
+   transports are served by the same process behind the same auth.)
 7. **Attach the integration to the recipe.**
 8. **In the recipe, add the recurring automation** that calls `check_moves`
    on a schedule (e.g. every 15 minutes). `check_moves` returns crossings for
    the calling user only and resets their baselines, so Poke messages each
    user exactly once per crossing.
 
-Deploy log sanity check — startup should print `[auth] bearer enforced` and
-`[state] /data/watches.json`. If it prints `bearer DISABLED`, the token
-variable is missing: fix it before wiring Kitchen.
+Deploy log sanity check — startup should print `[auth] bearer enforced`,
+`[state] /data/watches.json`, `[mcp] streamable HTTP mounted at /mcp`, and
+`[mcp] SSE mounted at /sse (POST /messages/)`. If it prints `bearer
+DISABLED`, the token variable is missing: fix it before wiring Kitchen.
 
 ## Local tunnel demo (alternative to deploying)
 

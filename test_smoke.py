@@ -24,6 +24,11 @@ data:
   - a sub-1-point threshold is clamped to the 1-point floor with an
     explanation (Polymarket displays whole percentages).
 
+Then it checks the SSE transport (the one Poke's hosted integration uses):
+initialize handshake and tool listing over /sse, per-user scoping across two
+SSE sessions with different X-Poke-User-Id headers, and — when
+MCP_AUTH_TOKEN is set — that a token-less SSE connection is rejected.
+
 It also runs in-process unit tests of the alert layer first (no network):
 site-style display rounding (whole percent, half-up, one-decimal fallback so
 no alert reads "37% to 37%"), the 1-point noise floor, single-alert baseline
@@ -48,9 +53,12 @@ os.environ["STATE_FILE"] = os.path.join(
 import server
 
 from mcp import ClientSession
+from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 
 URL = os.environ.get("MCP_URL", "http://localhost:3000/mcp")
+# The SSE event-stream endpoint lives at /sse on the same server.
+SSE_URL = os.environ.get("MCP_SSE_URL", URL.removesuffix("/mcp") + "/sse")
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 EXPECTED_TOOLS = {
     "search_markets",
@@ -146,10 +154,73 @@ def unit_tests() -> None:
     print("unit tests ok: display rounding, single-alert reset, noise floor")
 
 
-async def main() -> None:
-    headers = {"X-Poke-User-Id": "smoke-test"}
+def _headers(user_id: str, token: str | None = AUTH_TOKEN) -> dict:
+    headers = {"X-Poke-User-Id": user_id}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+async def sse_checks(watch_token_id: str) -> None:
+    """The SSE transport (what Poke's integration connects to): handshake and
+    tool listing over /sse, per-user scoping across two SSE sessions, and —
+    when auth is on — rejection of a token-less connection."""
+    label = "smoke-test sse watch"
+    async with sse_client(SSE_URL, headers=_headers("smoke-sse-a")) as (read, write):
+        async with ClientSession(read, write) as session:
+            info = await session.initialize()
+            tools = {t.name for t in (await session.list_tools()).tools}
+            missing = EXPECTED_TOOLS - tools
+            assert not missing, f"missing tools over SSE: {missing}"
+            print(f"sse handshake ok: {info.serverInfo.name}, tools {sorted(tools)}")
+
+            result = await session.call_tool(
+                "watch_market", {"token_id": watch_token_id, "label": label}
+            )
+            assert not result.isError and "Watching" in result.content[0].text, (
+                f"sse watch failed: {result.content}"
+            )
+            result = await session.call_tool("list_watches", {})
+            labels = {json.loads(c.text)["label"] for c in result.content}
+            assert label in labels, f"sse watch not listed for its owner: {labels}"
+
+    # A different X-Poke-User-Id on its own SSE session must not see user a's
+    # watch — the user id must reach tools from the SSE GET's headers.
+    async with sse_client(SSE_URL, headers=_headers("smoke-sse-b")) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("list_watches", {})
+            labels = {json.loads(c.text)["label"] for c in result.content}
+            assert label not in labels, (
+                f"user b sees user a's watch over SSE: {labels}"
+            )
+
+    async with sse_client(SSE_URL, headers=_headers("smoke-sse-a")) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("unwatch", {"label": label})
+            assert "Removed" in result.content[0].text, result.content[0].text
+    print("sse per-user scoping ok")
+
     if AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
+        try:
+            async with sse_client(SSE_URL, headers=_headers("smoke-sse-a", None)) as (
+                read,
+                write,
+            ):
+                async with ClientSession(read, write) as session:
+                    await asyncio.wait_for(session.initialize(), timeout=10)
+            raise AssertionError("token-less SSE connection was accepted")
+        except AssertionError:
+            raise
+        except BaseException as e:
+            print(f"sse auth ok: token-less connect rejected ({type(e).__name__})")
+    else:
+        print("sse auth check skipped (MCP_AUTH_TOKEN not set)")
+
+
+async def main() -> None:
+    headers = _headers("smoke-test")
     async with streamablehttp_client(URL, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:
             info = await session.initialize()
@@ -259,6 +330,8 @@ async def main() -> None:
             assert not parse_events(result), "expected no events"
             assert "No open markets" in result.content[0].text
             print("empty-search ok")
+
+    await sse_checks(yes["token_id"])
 
     print("SMOKE TEST PASSED")
 
