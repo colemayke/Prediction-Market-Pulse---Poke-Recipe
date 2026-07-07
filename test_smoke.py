@@ -20,7 +20,14 @@ data:
   - links come from the API (https://polymarket.com/event/<slug>), never
     hand-built;
   - watching a bogus token returns a clear message instead of a bad watch;
-  - a nonsense query returns a helpful message, not an error.
+  - a nonsense query returns a helpful message, not an error;
+  - a sub-1-point threshold is clamped to the 1-point floor with an
+    explanation (Polymarket displays whole percentages).
+
+It also runs in-process unit tests of the alert layer first (no network):
+site-style display rounding (whole percent, half-up, one-decimal fallback so
+no alert reads "37% to 37%"), the 1-point noise floor, single-alert baseline
+reset, and legacy-watch formatting.
 
 Queries are chosen to stay live for a long time ("recession" markets run to
 end of year; "presidential election" boards run for years).
@@ -30,6 +37,15 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
+
+# Import the server module in-process for the detection/formatting unit tests
+# (no network, no MCP). A scratch STATE_FILE keeps it away from real state;
+# the running server being smoke-tested is a separate process and unaffected.
+os.environ["STATE_FILE"] = os.path.join(
+    tempfile.mkdtemp(prefix="pmp-test-"), "watches.json"
+)
+import server
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -73,6 +89,61 @@ def assert_well_formed(events: list[dict]) -> None:
             assert o.get("price") is None or 0 <= o["price"] <= 1, (
                 f"price out of range: {o}"
             )
+
+
+def unit_tests() -> None:
+    """Detection and alert-formatting behaviour, no network required."""
+    # Site-style display: whole percent, rounded half-up like polymarket.com.
+    assert server._display_pct(0.365) == 37
+    assert server._display_pct(0.364) == 36
+    assert server._display_pair(0.30, 0.40) == (30, 40)
+    # Rounding that would collapse to "37% to 37%" falls back to one decimal.
+    assert server._display_pair(0.371, 0.374) == (37.1, 37.4)
+
+    uid = "unit-test"
+    server.STATE[uid] = {
+        "usa": {
+            "token_id": "tok",
+            "threshold": 5.0,
+            "last_price": 0.30,
+            "outcome": "United States",
+            "market": "United States vs. Belgium",
+            "url": "https://polymarket.com/event/fifwc-usa-bel-2026-07-06",
+        }
+    }
+
+    # One crossing -> exactly one alert; the baseline resets, so the same
+    # price on the next poll cycle must not re-alert.
+    hits = server._apply_moves(uid, {"usa": 0.40}, reset=True)
+    assert len(hits) == 1, hits
+    h = hits[0]
+    assert (h["old_pct"], h["new_pct"], h["delta_pts"]) == (30, 40, 10.0), h
+    assert "'United States' in United States vs. Belgium" in h["summary"], h
+    assert "30% to 40%" in h["summary"] and "+10.0 pts" in h["summary"], h
+    assert "https://polymarket.com/event/fifwc-usa-bel-2026-07-06" in h["summary"]
+    assert server._apply_moves(uid, {"usa": 0.40}, reset=True) == [], (
+        "same move alerted twice"
+    )
+
+    # Sub-visible noise: even a legacy watch stored with a 0.25-point
+    # threshold must not fire below the 1-point floor (whole-percent display).
+    server.STATE[uid]["usa"]["threshold"] = 0.25
+    assert server._apply_moves(uid, {"usa": 0.404}, reset=True) == [], (
+        "sub-1-point noise fired an alert"
+    )
+    hits = server._apply_moves(uid, {"usa": 0.412}, reset=True)
+    assert len(hits) == 1, "a visible 1.2-point move should fire"
+
+    # A watch from before display fields existed still formats an alert.
+    server.STATE[uid]["legacy"] = {
+        "token_id": "tok2", "threshold": 5.0, "last_price": 0.50,
+    }
+    (h,) = server._apply_moves(uid, {"legacy": 0.60}, reset=True)
+    assert "'legacy' moved 50% to 60%" in h["summary"], h
+    assert h["url"] is None
+
+    del server.STATE[uid]
+    print("unit tests ok: display rounding, single-alert reset, noise floor")
 
 
 async def main() -> None:
@@ -153,6 +224,24 @@ async def main() -> None:
             assert "Removed" in result.content[0].text, result.content[0].text
             print("list/unwatch ok")
 
+            # --- sub-1-point threshold is clamped, with an explanation -----
+            label = "smoke-test clamp watch"
+            result = await session.call_tool(
+                "watch_market",
+                {"token_id": yes["token_id"], "label": label, "threshold_points": 0.25},
+            )
+            text = result.content[0].text
+            assert "Watching" in text, f"clamped watch failed: {text}"
+            assert "1-point minimum" in text and "whole percentages" in text, (
+                f"clamp not explained: {text}"
+            )
+            result = await session.call_tool("list_watches", {})
+            watched = [json.loads(c.text) for c in result.content]
+            clamped = next(w for w in watched if w["label"] == label)
+            assert clamped["threshold"] == 1.0, f"threshold not clamped: {clamped}"
+            await session.call_tool("unwatch", {"label": label})
+            print(f"clamp ok: {text}")
+
             # --- watching a bogus token fails clearly, not silently --------
             result = await session.call_tool(
                 "watch_market", {"token_id": "1234567890", "label": "bogus"}
@@ -176,6 +265,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
+        unit_tests()
         asyncio.run(main())
     except AssertionError as e:
         print(f"SMOKE TEST FAILED: {e}")

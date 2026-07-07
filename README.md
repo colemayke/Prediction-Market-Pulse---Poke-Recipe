@@ -9,15 +9,42 @@ watched market's odds move past a threshold.
 | Tool | What it does |
 |---|---|
 | `search_markets(query)` | Search open Polymarket events by keyword. Returns up to 8 events, each with `title`, `url` (the live polymarket.com page, taken from the API), and `outcomes` — **every** selectable outcome as `{outcome, token_id, price}` (price 0–1). A yes/no market is two outcomes; a sports matchup is three (e.g. USA / Draw / Belgium); an election board is one per candidate (capped at the top 12 by price, with a note). Settled markets are excluded. |
-| `watch_market(token_id, label, threshold_points=5)` | Watch **one specific outcome** (its `token_id` from `search_markets`); baseline is that outcome's current price; threshold is in percentage points. Watching a settled or unknown token returns a clear message instead of a bad watch. |
+| `watch_market(token_id, label, threshold_points=5)` | Watch **one specific outcome** (its `token_id` from `search_markets`); baseline is that outcome's current price; threshold is in percentage points (default 5, minimum 1 — see "Alert quality" below). Watching a settled or unknown token returns a clear message instead of a bad watch. |
 | `list_watches()` | Your watches with baseline and threshold. |
 | `unwatch(label)` | Remove a watch by label. |
-| `check_moves()` | Watches that crossed their threshold since the last check (`label`, `old_pct`, `new_pct`, `delta_pts`); resets their baselines. |
+| `check_moves()` | Watches that crossed their threshold since the last check; resets their baselines so one move alerts exactly once. Each move carries `label`, `outcome`, `market`, `old_pct`/`new_pct` (site-style whole percents), `delta_pts`, `url`, and `summary` (a ready-to-relay sentence with all of the above). |
 
 The binary yes/no case is just the two-outcome special case of the same
 mechanism — watching a yes/no market means watching its "Yes" outcome's
 token. Poke is instructed (via the tool docstrings) to present the outcomes
 and ask which one to track before calling `watch_market`.
+
+## Alert quality
+
+The rule every alert must satisfy: a user reading the alert and then opening
+Polymarket should see consistent numbers and agree a move happened.
+
+- **Detection runs at full precision, display matches the site.** Crossings
+  are detected on the raw CLOB midpoint (0–1) so the logic is exact, but
+  alert text shows whole percents rounded half-up — the way polymarket.com
+  displays prices. If whole-percent rounding would collapse old and new to
+  the same figure, the text shows one decimal instead, so no alert ever
+  reads "37% to 37%".
+- **1-point threshold floor.** Polymarket displays whole percentages, so a
+  move smaller than 1 point is invisible on the site and would read as a
+  false alert. The default threshold is 5 points; requests below 1 are
+  accepted but clamped to 1, and the `watch_market` reply explains why. The
+  floor is also enforced at detection time, so watches stored before the
+  floor existed can't fire on sub-visible noise either.
+- **Named and linked.** Every alert names the outcome and its market or
+  matchup (captured from the API at watch time — the token lookup's embedded
+  `events[0]` supplies the matchup title and canonical slug) and carries the
+  working `polymarket.com/event/<slug>` link, e.g.: `'United States' in
+  United States vs. Belgium moved 27% to 37% (+10.0 pts).
+  https://polymarket.com/event/fifwc-usa-bel-2026-07-06`.
+- **Exactly one alert per move.** The baseline resets to the alerted price
+  the moment a crossing is reported (in both the poller and `check_moves`),
+  so the same move is never re-reported on the next cycle.
 
 All state is scoped per user via the `X-Poke-User-Id` header Poke sends on
 every request (falls back to `"owner"` for local testing), persisted to a JSON
@@ -48,12 +75,15 @@ With the server running:
 .venv/bin/python test_smoke.py
 ```
 
-This completes an MCP initialize handshake over streamable HTTP, checks all
-five tools are listed, then exercises both market shapes against live data:
-a binary yes/no market (search → two outcomes → watch → list → unwatch) and
-a multi-outcome board (3+ labelled outcomes with distinct token ids), plus
-the failure modes (bogus token, nonsense query). To test an auth-enabled
-server (including the deployed one), pass the token and URL:
+This first runs in-process unit tests of the alert layer (display rounding,
+the 1-point noise floor, single-alert baseline reset), then completes an MCP
+initialize handshake over streamable HTTP, checks all five tools are listed,
+and exercises both market shapes against live data: a binary yes/no market
+(search → two outcomes → watch → list → unwatch) and a multi-outcome board
+(3+ labelled outcomes with distinct token ids), plus the failure modes
+(bogus token, nonsense query, sub-1-point threshold clamped with an
+explanation). To test an auth-enabled server (including the deployed one),
+pass the token and URL:
 
 ```bash
 MCP_URL=https://<your-app>.up.railway.app/mcp MCP_AUTH_TOKEN=<token> \

@@ -27,6 +27,7 @@ Requires Python 3.10+.  pip install -r requirements.txt
 
 import hmac
 import json
+import math
 import os
 import sys
 import threading
@@ -311,7 +312,10 @@ async def search_polymarket(query: str, limit: int = MAX_EVENTS) -> list[dict]:
 
 async def lookup_market_by_token(token_id: str) -> dict | None:
     """The Gamma market carrying this CLOB token, or None for tokens that are
-    unknown or already settled (Gamma omits closed markets from this query)."""
+    unknown or already settled (Gamma omits closed markets from this query).
+    Verified live 2026-07-06: the returned market embeds its parent event as
+    "events": [{"title": ..., "slug": ...}, ...], which supplies the matchup
+    name and canonical link stored on a watch for alert text."""
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(
             f"{GAMMA}/markets", params={"clob_token_ids": token_id}
@@ -319,6 +323,30 @@ async def lookup_market_by_token(token_id: str) -> dict | None:
         r.raise_for_status()
         markets = r.json()
     return markets[0] if markets else None
+
+
+def _watch_display_fields(
+    market: dict, token_id: str
+) -> tuple[str | None, str | None, str | None]:
+    """(outcome, market_title, url) to store on a watch so alerts can name
+    what moved and link to it. The outcome is the leg matching token_id; a
+    grouped event's YES leg is renamed to its board label (groupItemTitle),
+    e.g. "Yes" on "Will United States win..." becomes "United States"."""
+    try:
+        legs = _market_legs(market)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        legs = []
+    leg = next(
+        (l for l in legs if str(l["token_id"]) == str(token_id)), None
+    )
+    outcome = leg["outcome"] if leg else None
+    if outcome and outcome.lower() == "yes" and market.get("groupItemTitle"):
+        outcome = market["groupItemTitle"]
+    events = market.get("events") or []
+    ev = events[0] if events else {}
+    title = ev.get("title") or market.get("question")
+    url = f"https://polymarket.com/event/{ev['slug']}" if ev.get("slug") else None
+    return outcome, title, url
 
 
 def _parse_mid(payload: dict) -> float | None:
@@ -362,6 +390,64 @@ def poke_push(text: str) -> None:
 
 
 # --- move detection, shared by check_moves and the poller --------------------
+#
+# Detection runs on the full-precision CLOB midpoint so crossings are exact,
+# but polymarket.com displays whole percentages. Two consequences:
+#
+#   * Thresholds below 1 point would alert on moves invisible on the site
+#     ("it says it moved but the page shows 37% either way"), so 1 point is
+#     the enforced floor — watch_market clamps requests below it and says so.
+#   * Alert text shows site-style whole percents. If whole-percent rounding
+#     would collapse old and new to the same number, one decimal is shown
+#     instead so a message never reads "37% to 37%".
+
+DEFAULT_THRESHOLD_POINTS = 5.0
+MIN_THRESHOLD_POINTS = 1.0
+
+
+def _display_pct(p: float) -> int:
+    """Whole percent rounded half-up, matching polymarket.com's display.
+    The inner round() flattens float representation error (0.365 * 100 is
+    36.4999...) before the half-up step."""
+    return math.floor(round(p * 100, 6) + 0.5)
+
+
+def _display_pair(old: float, new: float) -> tuple[float, float]:
+    """Old/new prices (0..1) as site-style whole percents, falling back to
+    one decimal when whole-percent rounding would make them look equal."""
+    o, n = _display_pct(old), _display_pct(new)
+    if o != n:
+        return o, n
+    return round(old * 100, 1), round(new * 100, 1)
+
+
+def _build_hit(label: str, w: dict, old: float, new: float) -> dict:
+    """One alert payload. The summary line is the user-facing sentence: it
+    names the outcome and its market/matchup, shows old -> new the way the
+    site displays them, the move in points, and the API-sourced link.
+    Watches recorded before display fields were stored fall back to their
+    label with no link."""
+    delta = round((new - old) * 100, 1)
+    old_d, new_d = _display_pair(old, new)
+    outcome = w.get("outcome") or label
+    market = w.get("market")
+    url = w.get("url")
+    where = f"'{outcome}' in {market}" if market else f"'{outcome}'"
+    sign = "+" if delta >= 0 else ""
+    summary = f"{where} moved {old_d}% to {new_d}% ({sign}{delta} pts)."
+    if url:
+        summary += f" {url}"
+    return {
+        "label": label,
+        "outcome": outcome,
+        "market": market,
+        "old_pct": old_d,
+        "new_pct": new_d,
+        "delta_pts": delta,
+        "url": url,
+        "summary": summary,
+    }
+
 
 def _snapshot_watches(uid: str) -> dict[str, dict]:
     with _lock:
@@ -371,7 +457,9 @@ def _snapshot_watches(uid: str) -> dict[str, dict]:
 def _apply_moves(uid: str, prices: dict[str, float], reset: bool) -> list[dict]:
     """Compare fetched prices against baselines; return threshold crossings.
     Prices are fetched by the caller (async tools vs. the sync poller) so a
-    single failed market never aborts the pass -- it is simply absent here."""
+    single failed market never aborts the pass -- it is simply absent here.
+    With reset=True the baseline moves to the alerted price, so one crossing
+    produces exactly one alert rather than repeating every poll cycle."""
     hits: list[dict] = []
     with _lock:
         watches = STATE.get(uid, {})
@@ -380,15 +468,10 @@ def _apply_moves(uid: str, prices: dict[str, float], reset: bool) -> list[dict]:
             if w is None:
                 continue  # unwatched while we were fetching
             delta = (price - w["last_price"]) * 100
-            if abs(delta) >= w["threshold"]:
-                hits.append(
-                    {
-                        "label": label,
-                        "old_pct": round(w["last_price"] * 100, 1),
-                        "new_pct": round(price * 100, 1),
-                        "delta_pts": round(delta, 1),
-                    }
-                )
+            # Floor applies even to thresholds stored before it existed.
+            threshold = max(w["threshold"], MIN_THRESHOLD_POINTS)
+            if abs(delta) >= threshold:
+                hits.append(_build_hit(label, w, w["last_price"], price))
                 if reset:
                     w["last_price"] = price
         if reset and hits:
@@ -426,17 +509,24 @@ async def search_markets(query: str) -> list[dict] | str:
 
 @mcp.tool()
 async def watch_market(
-    token_id: str, label: str, threshold_points: float = 5.0
+    token_id: str, label: str, threshold_points: float = DEFAULT_THRESHOLD_POINTS
 ) -> str:
     """Start watching one outcome of a Polymarket market for odds moves.
     token_id must be the token_id of the specific outcome to track, taken
     from search_markets (for a yes/no market that is usually the "Yes"
     outcome; for a matchup pick the side, e.g. USA-to-win's token). Records
     the current probability as the baseline; the watch counts as "moved" once
-    it shifts by at least threshold_points percentage points. Pick a label
-    that names BOTH the outcome and the market unambiguously, e.g. "USA to
-    win (USA vs Belgium)" — it is how the watch is referenced later."""
+    it shifts by at least threshold_points percentage points (default 5,
+    minimum 1 — Polymarket displays whole percentages, so requests below 1
+    are clamped to 1 and the reply says so). Pick a label that names BOTH
+    the outcome and the market unambiguously, e.g. "USA to win (USA vs
+    Belgium)" — it is how the watch is referenced later."""
+    threshold = float(threshold_points)
+    clamped = threshold < MIN_THRESHOLD_POINTS
+    if clamped:
+        threshold = MIN_THRESHOLD_POINTS
     market = None
+    outcome = market_title = url = None
     try:
         market = await lookup_market_by_token(token_id)
     except (httpx.HTTPError, ValueError) as e:
@@ -454,6 +544,7 @@ async def watch_market(
                 f"That market ('{market.get('question')}') has settled and "
                 "can no longer be watched."
             )
+        outcome, market_title, url = _watch_display_fields(market, token_id)
     try:
         price = await fetch_price(token_id)
     except httpx.HTTPError as e:
@@ -464,14 +555,27 @@ async def watch_market(
     with _lock:
         STATE.setdefault(uid, {})[label] = {
             "token_id": token_id,
-            "threshold": float(threshold_points),
+            "threshold": threshold,
             "last_price": price,
+            # Display fields for alert text; None when validation was skipped.
+            "outcome": outcome,
+            "market": market_title,
+            "url": url,
         }
         save_state(STATE)
-    return (
-        f"Watching '{label}' at {price * 100:.1f}%. "
-        f"Alerting on {threshold_points:.0f} point moves."
+    what = f"'{outcome}' in {market_title}" if outcome and market_title else f"'{label}'"
+    reply = (
+        f"Watching {what} as '{label}' at {price * 100:.1f}%. "
+        f"Alerting on {threshold:g} point moves."
     )
+    if clamped:
+        reply += (
+            f" Note: you asked for {threshold_points:g} points, but "
+            "Polymarket displays whole percentages, so moves smaller than 1 "
+            "point aren't visible on the site — the threshold was raised to "
+            "the 1-point minimum."
+        )
+    return reply
 
 
 @mcp.tool()
@@ -502,10 +606,15 @@ def unwatch(label: str) -> str:
 @mcp.tool()
 async def check_moves() -> list[dict]:
     """Check this user's watched markets for odds moves that crossed their
-    threshold since the last check, and reset the baseline for any that did.
-    Returns a list of moves, each with label, old_pct, new_pct, and delta_pts
-    (all in percentage points). Empty list means nothing moved enough. Meant
-    to be called on a schedule by a Poke automation."""
+    threshold since the last check, and reset the baseline for any that did
+    (so one move alerts exactly once). Returns a list of moves, each with
+    label, outcome, market, old_pct, new_pct (whole percents as Polymarket
+    displays them; one decimal only if they would otherwise look equal),
+    delta_pts, url (the live Polymarket page), and summary (a ready-to-send
+    sentence containing all of the above — relay its figures and link
+    verbatim so the user sees the same numbers as the site). Empty list means
+    nothing moved enough. Meant to be called on a schedule by a Poke
+    automation."""
     uid = current_user()
     watches = _snapshot_watches(uid)
     prices: dict[str, float] = {}
@@ -543,11 +652,8 @@ def poller() -> None:
                         except (httpx.HTTPError, ValueError) as e:
                             print(f"[poller] '{label}' fetch failed: {e}")
                     for hit in _apply_moves(uid, prices, reset=True):
-                        sign = "+" if hit["delta_pts"] >= 0 else ""
                         poke_push(
-                            f"Heads up: Polymarket '{hit['label']}' moved "
-                            f"{hit['old_pct']}% to {hit['new_pct']}% "
-                            f"({sign}{hit['delta_pts']} pts). "
+                            f"Heads up, Polymarket move: {hit['summary']} "
                             f"Give me a one line take and the current odds."
                         )
         except Exception as e:
