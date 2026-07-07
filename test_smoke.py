@@ -29,6 +29,11 @@ initialize handshake and tool listing over /sse, per-user scoping across two
 SSE sessions with different X-Poke-User-Id headers, and — when
 MCP_AUTH_TOKEN is set — that a token-less SSE connection is rejected.
 
+Host validation (DNS-rebinding protection) is covered both ways: the SSE
+handshake above connects with an allowed Host (the URL's own host — which on
+a deployed server is exactly the ALLOWED_HOSTS domain), and a spoofed
+disallowed Host header must be refused with 421 on both transports.
+
 It also runs in-process unit tests of the alert layer first (no network):
 site-style display rounding (whole percent, half-up, one-decimal fallback so
 no alert reads "37% to 37%"), the 1-point noise floor, single-alert baseline
@@ -52,6 +57,7 @@ os.environ["STATE_FILE"] = os.path.join(
 )
 import server
 
+import httpx
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
@@ -219,6 +225,30 @@ async def sse_checks(watch_token_id: str) -> None:
         print("sse auth check skipped (MCP_AUTH_TOKEN not set)")
 
 
+async def host_validation_checks() -> None:
+    """A spoofed, disallowed Host header must be refused with 421 on both
+    transports (DNS-rebinding protection stays on; only the deployment's own
+    hosts are allowed). The allowed-host side needs no separate check: every
+    handshake in this file connects with the URL's own Host, which on a
+    deployed server is exactly the ALLOWED_HOSTS domain."""
+    bad = {**_headers("smoke-test"), "Host": "smoke-disallowed.invalid"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        async with client.stream("GET", SSE_URL, headers=bad) as r:
+            assert r.status_code == 421, (
+                f"disallowed Host on /sse got {r.status_code}, expected 421"
+            )
+        r = await client.post(
+            URL,
+            headers={**bad, "Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        )
+        assert r.status_code == 421, (
+            f"disallowed Host on /mcp got {r.status_code}, expected 421"
+        )
+    print("host validation ok: disallowed Host refused with 421 on /sse and /mcp")
+
+
 async def main() -> None:
     headers = _headers("smoke-test")
     async with streamablehttp_client(URL, headers=headers) as (read, write, _):
@@ -332,6 +362,7 @@ async def main() -> None:
             print("empty-search ok")
 
     await sse_checks(yes["token_id"])
+    await host_validation_checks()
 
     print("SMOKE TEST PASSED")
 

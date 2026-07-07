@@ -8,9 +8,10 @@ Two jobs in one process:
      transports on the same port: streamable HTTP at /mcp (what
      `npx poke tunnel http://localhost:3000/mcp` uses) and SSE at /sse with
      its POST companion at /messages/ (what Poke's hosted integration
-     connects to — verified live 2026-07-06: Poke pointed at /mcp fails
-     with 421, pointed at /sse it speaks SSE, and its docs only show
-     .../sse server URLs).
+     connects to; Poke's docs only show .../sse server URLs). Both
+     transports validate the Host header (DNS-rebinding protection), so a
+     public deployment must list its domain in ALLOWED_HOSTS or every
+     proxied request 421s with "Invalid Host header".
 
   2. A background poller that checks watched Polymarket markets and, when a
      market moves past its threshold, texts you via the Poke API. This is the
@@ -47,6 +48,7 @@ sys.stdout.reconfigure(line_buffering=True)
 import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 # --- configuration -----------------------------------------------------------
@@ -69,6 +71,18 @@ PUSH_MODE = os.environ.get("PUSH_MODE", "0") == "1"
 # Bearer token for the public endpoint. When set, every request must carry
 # Authorization: Bearer <token>. Unset = open (local development only).
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+
+# Public hostnames this deployment is reachable as, comma-separated, e.g.
+# "myapp.up.railway.app,markets.example.com". The MCP SDK validates the Host
+# (and Origin) header on BOTH transports as DNS-rebinding protection, and
+# behind Railway's proxy the forwarded Host is the public domain — so a fresh
+# deploy 421s ("Invalid Host header" in the log) until this is set to that
+# domain. Hosts must be explicit: the SDK matches exactly (plus an optional
+# ":<port>"), with no subdomain wildcards. Localhost is always allowed, so
+# local dev and the tunnel need nothing here.
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()
+]
 
 # State lands on the Railway volume when one is attached (Railway exposes its
 # mount path as RAILWAY_VOLUME_MOUNT_PATH, e.g. /data); explicit STATE_FILE
@@ -486,8 +500,27 @@ def _apply_moves(uid: str, prices: dict[str, float], reset: bool) -> list[dict]:
 # --- MCP server and tools ----------------------------------------------------
 # stateless_http: every request is self-contained, which is what Poke expects
 # and what lets the header middleware's contextvar reach the tool handlers.
+#
+# transport_security: DNS-rebinding protection stays ON for both transports;
+# we only widen the Host/Origin allowlist. Without an explicit setting the
+# SDK allows localhost only, which is what 421'd every request arriving via
+# Railway's proxy with the public domain in Host. Each ALLOWED_HOSTS entry is
+# allowed bare and with any port, plus its https:// Origin (Poke's
+# server-to-server client sends no Origin header, and an absent Origin
+# passes; the origin entry covers browser-based clients on the same host).
+# The localhost entries mirror the SDK's own local-dev defaults.
 
-mcp = FastMCP("Prediction Market Pulse", stateless_http=True)
+_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    + [form for h in ALLOWED_HOSTS for form in (h, f"{h}:*")],
+    allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+    + [f"https://{h}" for h in ALLOWED_HOSTS],
+)
+
+mcp = FastMCP(
+    "Prediction Market Pulse", stateless_http=True, transport_security=_security
+)
 
 
 @mcp.tool()
@@ -757,6 +790,12 @@ if __name__ == "__main__":
     print(f"[state] {STATE_FILE}")
     for name, path in TRANSPORTS.items():
         print(f"[mcp] {name} mounted at {path}")
+    print(
+        "[hosts] allowed: localhost + " + ", ".join(ALLOWED_HOSTS)
+        if ALLOWED_HOSTS
+        else "[hosts] allowed: localhost only — public deploys must set "
+        "ALLOWED_HOSTS to their domain or every request 421s"
+    )
     print(f"MCP on http://localhost:{PORT}/mcp (streamable HTTP) "
           f"and http://localhost:{PORT}/sse (SSE — the URL Poke needs)")
     uvicorn.run(app, host="0.0.0.0", port=PORT)

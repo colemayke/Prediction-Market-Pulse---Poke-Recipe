@@ -217,19 +217,28 @@ Do these in order:
    - `STATE_FILE=/data/watches.json` (optional — this is already the derived
      default once the volume is mounted at `/data`)
    - Do **not** set `POKE_API_KEY`; the deployed server never pushes.
+   - `ALLOWED_HOSTS` comes in step 5, once the domain exists.
 5. **Deploy**, then generate/copy the public HTTPS domain Railway assigns
-   (Settings → Networking) and append `/sse`:
+   (Settings → Networking) and set **`ALLOWED_HOSTS`** to exactly that domain
+   (no scheme, no path — e.g.
+   `ALLOWED_HOSTS=prediction-market-pulse-production.up.railway.app`), which
+   redeploys. **Without it every request 421s**: both MCP transports validate
+   the Host header as DNS-rebinding protection, only localhost is allowed by
+   default, and behind Railway's proxy the Host is this public domain
+   (the deploy log shows `Invalid Host header: <domain>`). It is
+   comma-separated — append a custom domain later if you add one. Validation
+   stays on for everything else; this only allowlists your own domain(s).
+   The Poke server URL is then that domain plus `/sse`:
    `https://<your-app>.up.railway.app/sse`.
 6. **In Poke Kitchen** ([poke.com/kitchen](https://poke.com/kitchen)), open the
    integration template: Server URL = that **`/sse`** URL, **Auth Type =
    Bearer**, token = the same `MCP_AUTH_TOKEN` value. Poke's integration
-   speaks the SSE transport — pointing it at `/mcp` fails with a 421
-   (verified live), while `/sse` is the endpoint it expects (Poke's docs show
-   `https://.../sse` server URLs throughout). Poke sends
-   `Authorization: Bearer <token>` on every request, which is exactly what
-   the server's auth middleware checks. Hit Test connection — it should list
-   the five tools. (`/mcp` stays mounted for the local tunnel workflow; both
-   transports are served by the same process behind the same auth.)
+   speaks the SSE transport, and its docs show `https://.../sse` server URLs
+   throughout. Poke sends `Authorization: Bearer <token>` on every request,
+   which is exactly what the server's auth middleware checks. Hit Test
+   connection — it should list the five tools. (`/mcp` stays mounted for the
+   local tunnel workflow; both transports are served by the same process
+   behind the same auth and the same host allowlist.)
 7. **Attach the integration to the recipe.**
 8. **In the recipe, add the recurring automation** that calls `check_moves`
    on a schedule (e.g. every 15 minutes). `check_moves` returns crossings for
@@ -237,9 +246,12 @@ Do these in order:
    user exactly once per crossing.
 
 Deploy log sanity check — startup should print `[auth] bearer enforced`,
-`[state] /data/watches.json`, `[mcp] streamable HTTP mounted at /mcp`, and
-`[mcp] SSE mounted at /sse (POST /messages/)`. If it prints `bearer
-DISABLED`, the token variable is missing: fix it before wiring Kitchen.
+`[state] /data/watches.json`, `[mcp] streamable HTTP mounted at /mcp`,
+`[mcp] SSE mounted at /sse (POST /messages/)`, and `[hosts] allowed:
+localhost + <your domain>`. If it prints `bearer DISABLED`, the token
+variable is missing; if it prints `[hosts] allowed: localhost only`,
+`ALLOWED_HOSTS` is missing and every request will 421 — fix both before
+wiring Kitchen.
 
 ## Local tunnel demo (alternative to deploying)
 
